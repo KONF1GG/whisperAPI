@@ -1,0 +1,23 @@
+version: '3.8'
+
+services:
+  whisperx-api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: whisperx-api
+    runtime: nvidia  # Use the NVIDIA runtime for GPU support
+    ports:
+      - "8000:8000"  # Expose port 8000 for the API
+    env_file:
+      - .env  # Load environment variables from .env file
+    environment:
+      - DEBIAN_FRONTEND=noninteractive  # Avoid interactive prompts during package installation
+      - TZ=Etc/UTC  # Set the timezone to UTC (or your preferred timezone)
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1  # Use 1 GPU
+              capabilities: [gpu]  # Enable GPU capabilities

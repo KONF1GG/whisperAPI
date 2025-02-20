@@ -23,7 +23,7 @@ class TranscriptionAPISettings(BaseSettings):
     cors_allow_methods: str = '*'
     cors_allow_headers: str = '*'
     whisper_model: str = 'large-v3'
-    device: str = 'cpu'
+    device: str = 'cuda'
     compute_type: str = 'float32'
     batch_size: int = 4
     language_code: str = 'ru'

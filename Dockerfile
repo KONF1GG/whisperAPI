@@ -1,6 +1,6 @@
 # Use the NVIDIA CUDA 12.8 runtime image as the base image
 ARG IMAGE_NAME=nvidia/cuda
-FROM ${IMAGE_NAME}:12.8.0-runtime-ubuntu20.04 as base
+FROM ${IMAGE_NAME}:12.5.1-runtime-ubuntu20.04 as base
 
 # Define the base image for amd64 architecture
 FROM base as base-amd64

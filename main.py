@@ -7,15 +7,14 @@ from queue import Queue
 from threading import Thread
 from typing import Any
 from threading import Semaphore
-
 from fastapi import File, HTTPException, BackgroundTasks, FastAPI, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic_settings import BaseSettings
-import uvicorn
-import whisperx
 from pydub import AudioSegment
+import torch
+from apscheduler.schedulers.background import BackgroundScheduler
+import whisper
 
-# Настройки приложения
 class TranscriptionAPISettings(BaseSettings):
     tmp_dir: str = 'tmp'
     cors_origins: str = '*'
@@ -47,85 +46,87 @@ app.add_middleware(
     allow_headers=settings.cors_allow_headers.split(','),
 )
 
-# Глобальные переменные для хранения задач и моделей
 trancription_tasks = {}
 trancription_tasks_queue = Queue()
-whisperx_models = None
+whisperx_models = None  # Переименуем для совместимости
 
-def load_whisperx_models() -> None:
+def load_whisperx_models(device: str = "cpu") -> None:
     global whisperx_models
-    whisperx_models = whisperx.load_model(
-        whisper_arch=settings.whisper_model,
-        device=settings.device,
-        compute_type=settings.compute_type,
-        language=settings.language_code if settings.language_code != "auto" else None
-    )
+    whisperx_models = whisper.load_model(settings.whisper_model, device=device)
 
-# Функция для конвертации аудио в WAV
 def convert_to_wav(input_path: str) -> str:
-    """Конвертирует любой аудиофайл в WAV с параметрами для ASR"""
     output_path = os.path.splitext(input_path)[0] + ".wav"
-
     try:
         audio = AudioSegment.from_file(input_path)
         audio = audio.set_frame_rate(16000).set_channels(1)
-        audio.export(
-            output_path,
-            format="wav",
-            parameters=["-ac", "1", "-ar", "16000"]
-        )
+        audio.export(output_path, format="wav", parameters=["-ac", "1", "-ar", "16000"])
         return output_path
     except Exception as e:
         raise RuntimeError(f"Audio conversion error: {str(e)}") from e
 
-# Функция для транскрипции аудио файла
+class WhisperModelManager:
+    def __enter__(self):
+        if whisperx_models:
+            whisperx_models.to(settings.device)
+            print("Model moved to GPU.")
+        return whisperx_models
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        if whisperx_models:
+            whisperx_models.to("cpu")
+            print("Model moved to CPU.")
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            print("GPU memory cache cleared.")
+
 def transcribe_audio(audio_file_path: str) -> dict:
     original_path = audio_file_path
     wav_path = None
     try:
-        # Конвертируем в WAV если нужно
         if not audio_file_path.lower().endswith('.wav'):
             print(f"Converting {audio_file_path} to WAV...")
             wav_path = convert_to_wav(audio_file_path)
             audio_file_path = wav_path
 
-        # Загрузка аудио
-        audio = whisperx.load_audio(audio_file_path)
-
-        # Транскрипция
-        return whisperx_models.transcribe(
-            audio,
-            batch_size=int(settings.batch_size)
+        result = whisperx_models.transcribe(
+            audio_file_path,
+            language=settings.language_code if settings.language_code != "auto" else None
         )
 
+        formatted_result = {
+            "language": result["language"],
+            "segments": [
+                {"start": segment["start"], "end": segment["end"], "text": segment["text"]}
+                for segment in result["segments"]
+            ]
+        }
+        return formatted_result
+
     finally:
-        # Удаляем временные файлы
         for path in [audio_file_path, original_path, wav_path]:
             if path and os.path.exists(path) and path != original_path:
                 try:
                     os.remove(path)
                     print(f"Deleted temp file {path}")
+                except PermissionError:
+                    print(f"Permission error: Could not delete temp file {path}.")
                 except Exception as e:
                     print(f"Error deleting temp file {path}: {str(e)}")
 
-# Глобальная переменная для ограничения параллельных задач
 max_concurrent_tasks = 3
 concurrent_tasks_semaphore = Semaphore(max_concurrent_tasks)
 
 def transcription_worker() -> None:
     print("Transcription worker started.")
-    print(settings.device)
     while True:
         task_id, tmp_path = trancription_tasks_queue.get()
-
         print(f"Processing task {task_id} with file {tmp_path}")
 
-        # Используем Semaphore для ограничения количества параллельных задач
         with concurrent_tasks_semaphore:
             try:
-                result = transcribe_audio(tmp_path)
+                with WhisperModelManager():
+                    result = transcribe_audio(tmp_path)
                 trancription_tasks[task_id].update({"status": "completed", "result": result})
-
                 print(f"Task {task_id} completed.")
             except Exception as e:
                 trancription_tasks[task_id].update({"status": "failed", "result": str(e)})
@@ -133,26 +134,53 @@ def transcription_worker() -> None:
             finally:
                 trancription_tasks_queue.task_done()
 
-# Функция запуска worker при старте приложения
+scheduler = BackgroundScheduler()
+
+def cleanup_tmp_dir() -> None:
+    if trancription_tasks_queue.empty():
+        for file_name in os.listdir(settings.tmp_dir):
+            file_path = os.path.join(settings.tmp_dir, file_name)
+            try:
+                if os.path.isfile(file_path):
+                    os.remove(file_path)
+                    print(f"Deleted leftover temp file: {file_path}")
+            except Exception as e:
+                print(f"Error deleting temp file {file_path}: {str(e)}")
+
+def cleanup_completed_tasks() -> None:
+    now = datetime.utcnow()
+    completed_tasks = [
+        task_id for task_id, task in trancription_tasks.items()
+        if task["status"] in {"completed", "failed"} and
+        (now - task["creation_time"]).total_seconds() > 1200
+    ]
+    for task_id in completed_tasks:
+        del trancription_tasks[task_id]
+        print(f"Task {task_id} removed from memory.")
+
+async def cleanup_task(task_id: str) -> None:
+    await asyncio.sleep(20 * 60)
+    trancription_tasks.pop(task_id, None)
+
 @app.on_event("startup")
 async def startup_event() -> None:
     os.makedirs(settings.tmp_dir, exist_ok=True)
-    load_whisperx_models()
+    load_whisperx_models(device="cpu")
     Thread(target=transcription_worker, daemon=True).start()
+    scheduler.add_job(cleanup_tmp_dir, "interval", minutes=10)
+    scheduler.add_job(cleanup_completed_tasks, "interval", minutes=20)
+    scheduler.start()
 
-# Очистка задач, когда они не завершились
-async def cleanup_task(task_id: str) -> None:
-    await asyncio.sleep(5 * 60)
-    trancription_tasks.pop(task_id, None)
+@app.on_event("shutdown")
+async def shutdown_event() -> None:
+    scheduler.shutdown()
 
-# Эндпоинт для загрузки аудио файла и начала транскрипции
 @app.post("/transcribe/")
 async def create_upload_file(
     background_tasks: BackgroundTasks,
     file: UploadFile = File(...),
 ) -> dict:
     task_id = str(uuid.uuid4())
-
     if not os.path.exists(settings.tmp_dir):
         os.makedirs(settings.tmp_dir, exist_ok=True)
 
@@ -181,7 +209,6 @@ async def create_upload_file(
             detail=f"Error processing upload: {str(e)}"
         )
 
-    # Добавляем задачу в очередь для обработки
     trancription_tasks[task_id].update({"status": "processing"})
     trancription_tasks_queue.put((task_id, tmp_path))
 
@@ -193,11 +220,9 @@ async def create_upload_file(
         "status": trancription_tasks[task_id]["status"]
     }
 
-# Эндпоинт для получения статуса задачи
 @app.get("/transcribe/status/{task_id}")
 async def get_task_status(task_id: str) -> dict:
     task = trancription_tasks.get(task_id)
-
     if not task:
         raise HTTPException(status_code=404, detail="Task not found")
 
@@ -207,15 +232,13 @@ async def get_task_status(task_id: str) -> dict:
         "status": task["status"]
     }
 
-# Эндпоинт для получения результата транскрипции
 @app.get("/transcribe/result/{task_id}")
 async def get_task_result(task_id: str) -> dict:
     task = trancription_tasks.get(task_id)
-
     if not task:
         raise HTTPException(status_code=404, detail="Task not found")
 
-    if task["status"] == "loading" or task["status"] == "processing":
+    if task["status"] in {"loading", "processing"}:
         raise HTTPException(status_code=404, detail="Task not completed")
 
     return {

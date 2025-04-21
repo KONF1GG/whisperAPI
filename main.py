@@ -14,6 +14,7 @@ from pydub import AudioSegment
 import torch
 from apscheduler.schedulers.background import BackgroundScheduler
 import whisper
+from GPU_control import gpu_lock
 
 class TranscriptionAPISettings(BaseSettings):
     tmp_dir: str = 'tmp'
@@ -124,8 +125,9 @@ def transcription_worker() -> None:
 
         with concurrent_tasks_semaphore:
             try:
-                with WhisperModelManager():
-                    result = transcribe_audio(tmp_path)
+                with gpu_lock(timeout=30):
+                    with WhisperModelManager():
+                        result = transcribe_audio(tmp_path)
                 trancription_tasks[task_id].update({"status": "completed", "result": result})
                 print(f"Task {task_id} completed.")
             except Exception as e:

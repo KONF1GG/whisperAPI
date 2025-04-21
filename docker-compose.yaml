@@ -5,15 +5,14 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-    container_name: whisperx-api
-    # runtime: nvidia  
+    container_name: whisperx-api 
     ports:
       - "8000:8000"  
     env_file:
-      - .env 
-    # environment:
-    #   - DEBIAN_FRONTEND=noninteractive 
-    #   - TZ=Etc/UTC  
+      - .env
+    volumes:
+      - ~/.cache/huggingface/hub:/root/.cache/huggingface/hub
+      - shared-data:/shared 
     deploy:
       resources:
         reservations:
@@ -21,3 +20,6 @@ services:
             - driver: nvidia
               count: 1 
               capabilities: [gpu] 
+volumes:
+  shared-data:
+    external: true

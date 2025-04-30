@@ -22,9 +22,9 @@ class TranscriptionAPISettings(BaseSettings):
     cors_allow_credentials: bool = True
     cors_allow_methods: str = '*'
     cors_allow_headers: str = '*'
-    whisper_model: str = 'large-v3'
+    whisper_model: str = 'medium'
     device: str = 'cuda'
-    compute_type: str = 'float32'
+    compute_type: str = 'float16'
     batch_size: int = 4
     language_code: str = 'ru'
     hf_api_key: str = ''
@@ -102,6 +102,7 @@ def transcribe_audio(audio_file_path: str) -> dict:
             ]
         }
         return formatted_result
+    
 
     finally:
         for path in [audio_file_path, original_path, wav_path]:
